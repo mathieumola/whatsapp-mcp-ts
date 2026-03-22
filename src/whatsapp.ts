@@ -11,7 +11,8 @@ import {
 } from "@whiskeysockets/baileys";
 import P from "pino";
 import path from "node:path";
-import open from "open";
+// @ts-ignore no types available
+import qrcode from "qrcode-terminal";
 
 import {
   initializeDatabase,
@@ -21,7 +22,8 @@ import {
   type Message as DbMessage,
 } from "./database.ts";
 
-const AUTH_DIR = path.join(import.meta.dirname, "..", "auth_info");
+const dataDir = process.env.WHATSAPP_MCP_DATA_DIR || path.join(import.meta.dirname, "..");
+const AUTH_DIR = path.join(dataDir, "auth_info");
 
 export type WhatsAppSocket = ReturnType<typeof makeWASocket>;
 
@@ -120,12 +122,23 @@ export async function startWhatsAppConnection(
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
+        // Print QR code as text in the terminal for headless servers
+        // Each QR module is represented as unicode block characters
+        const QR_BLOCK = "\u2588\u2588";
+        const QR_SPACE = "  ";
+        // Use qrcode-terminal-like rendering via simple text output
+        // The QR data from Baileys is a string that can be rendered
         logger.info(
           { qrCodeData: qr },
-          "QR Code Received. Copy the qrCodeData string and use a QR code generator (e.g., online website) to display and scan it with your WhatsApp app."
+          "QR Code received. Scan with WhatsApp Business app. QR data logged below.",
         );
-        // for now we roughly open the QR code in a browser
-        await open(`https://quickchart.io/qr?text=${encodeURIComponent(qr)}`);
+        console.error("\n========================================");
+        console.error("  SCAN THIS QR CODE WITH WHATSAPP BUSINESS");
+        console.error("========================================\n");
+        qrcode.generate(qr, { small: true }, (qrText: string) => {
+          console.error(qrText);
+        });
+        console.error("\n========================================\n");
       }
 
       if (connection === "close") {

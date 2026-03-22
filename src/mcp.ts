@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import http from "node:http";
 import { z } from "zod";
 import { jidNormalizedUser } from "@whiskeysockets/baileys";
 
@@ -51,13 +52,11 @@ function formatDbChatForJson(chat: DbChat) {
   };
 }
 
-export async function startMcpServer(
+function createMcpServer(
   sock: WhatsAppSocket | null,
   mcpLogger: P.Logger,
   waLogger: P.Logger,
-): Promise<void> {
-  mcpLogger.info("Initializing MCP server...");
-
+): McpServer {
   const server = new McpServer({
     name: "whatsapp-baileys-ts",
     version: "0.1.0",
@@ -570,23 +569,81 @@ TABLE messages (id TEXT, chat_jid TEXT, sender TEXT, content TEXT, timestamp TIM
     };
   });
 
-  const transport = new StdioServerTransport();
-  mcpLogger.info("MCP server configured. Connecting stdio transport...");
+  return server;
+}
 
-  try {
-    await server.connect(transport);
-    mcpLogger.info(
-      "MCP transport connected. Server is ready and listening via stdio.",
-    );
-  } catch (error: any) {
-    mcpLogger.error(
-      `[FATAL] Failed to connect MCP transport: ${error.message}`,
-      error,
-    );
-    process.exit(1);
-  }
+interface Session {
+  server: McpServer;
+  transport: SSEServerTransport;
+}
 
-  mcpLogger.info(
-    "MCP Server setup complete. Waiting for requests from client...",
-  );
+export async function startMcpServer(
+  sock: WhatsAppSocket | null,
+  mcpLogger: P.Logger,
+  waLogger: P.Logger,
+): Promise<void> {
+  const port = Number(process.env.MCP_PORT || 3847);
+  const sessions: Record<string, Session> = {};
+
+  const httpServer = http.createServer(async (req, res) => {
+    const url = new URL(req.url || "", `http://localhost:${port}`);
+
+    // CORS headers
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+    if (req.method === "OPTIONS") {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    if (url.pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok", activeSessions: Object.keys(sessions).length }));
+      return;
+    }
+
+    if (url.pathname === "/sse") {
+      const sseTransport = new SSEServerTransport("/message", res);
+      const mcpServer = createMcpServer(sock, mcpLogger, waLogger);
+      const sessionId = sseTransport.sessionId;
+
+      sessions[sessionId] = { server: mcpServer, transport: sseTransport };
+      mcpLogger.info(`[SSE] New session: ${sessionId} (active: ${Object.keys(sessions).length})`);
+
+      res.on("close", () => {
+        mcpLogger.info(`[SSE] Session closed: ${sessionId}`);
+        mcpServer.close().catch(() => {});
+        delete sessions[sessionId];
+      });
+
+      await mcpServer.connect(sseTransport);
+      return;
+    }
+
+    if (url.pathname === "/message" && req.method === "POST") {
+      const sessionId = url.searchParams.get("sessionId");
+      if (!sessionId || !sessions[sessionId]) {
+        res.writeHead(404);
+        res.end("Session not found");
+        return;
+      }
+      await sessions[sessionId].transport.handlePostMessage(req, res);
+      return;
+    }
+
+    res.writeHead(404);
+    res.end("Not found");
+  });
+
+  httpServer.listen(port, () => {
+    mcpLogger.info(`WhatsApp MCP server (SSE) listening on port ${port}`);
+    mcpLogger.info(`  SSE endpoint: http://localhost:${port}/sse`);
+    mcpLogger.info(`  Health check: http://localhost:${port}/health`);
+    console.error(`WhatsApp MCP server (SSE) listening on port ${port}`);
+    console.error(`  SSE endpoint: http://localhost:${port}/sse`);
+    console.error(`  Health check: http://localhost:${port}/health`);
+  });
 }
